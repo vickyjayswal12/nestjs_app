@@ -4661,6 +4661,416 @@ Destroy hooks need app.enableShutdownHooks() in main.ts or they
 may not run on Ctrl+C / SIGTERM.
 
 
+
+=======================================================
+Socket.IO in NestJS — how it works in this project
+=======================================================
+
+Nest does not use raw WebSocket APIs by default for this feature.
+It uses: Nest WebSockets package + Socket.IO adapter.
+
+
+-------------------------------------------------------
+Packages
+-------------------------------------------------------
+
+  @nestjs/websockets          — Gateway decorators & lifecycle hooks
+  @nestjs/platform-socket.io  — Nest adapter that binds Socket.IO to Nest
+  socket.io                   — Server library (rooms, namespaces, reconnect)
+
+  Frontend uses: socket.io-client (must match major Socket.IO version)
+
+
+-------------------------------------------------------
+Controller vs Gateway
+-------------------------------------------------------
+
+  @Controller('notifications')     → HTTP REST (request → response → done)
+  @WebSocketGateway(...)           → long-lived connection; server can push anytime
+
+  Same Nest module can export both:
+    NotificationController  — list / unread / mark-read over HTTP
+    NotificationGateway     — live push + mark-read over socket
+
+  Rule in this codebase:
+    Feature services (representative, slot, client, …)
+      → call NotificationService.notify()
+      → Service writes Postgres
+      → Service asks Gateway to emit
+    Feature services NEVER call socket.emit themselves.
+
+
+-------------------------------------------------------
+Key Nest decorators (notification.gateway.ts)
+-------------------------------------------------------
+
+  @WebSocketGateway({ namespace, cors, path? })
+      Marks the class as a realtime handler.
+      Attaches Socket.IO to the same HTTP server as Nest (port 3000).
+
+  @WebSocketServer()
+      Injects the Socket.IO Server instance → this.server
+      Use for: this.server.to(room).emit(event, data)
+
+  @SubscribeMessage('event.name')
+      Handles messages FROM the client (like a route for sockets).
+      Example: @SubscribeMessage('notification.mark_read')
+
+  @ConnectedSocket()
+      Injects the current client Socket in a handler.
+
+  @MessageBody()
+      Injects the payload the client sent with emit().
+
+  Lifecycle interfaces:
+    OnGatewayConnection   → handleConnection(client)
+    OnGatewayDisconnect   → handleDisconnect(client)
+    OnModuleInit          → optional log when gateway is ready
+
+
+-------------------------------------------------------
+Connection lifecycle (our gateway)
+-------------------------------------------------------
+
+  1. Client connects to host + namespace /notifications
+     (transport hits /socket.io)
+
+  2. handleConnection(client)
+       - Read JWT from handshake.auth.token
+         (also supports Authorization: Bearer … or query.token)
+       - jwt.verifyAsync with JWT_ACCESS_SECRET
+       - Store userId / email / role on client.data
+       - client.join('user_<userId>')
+       - join team_* rooms for owned orgs + active memberships
+       - client.emit('notification.unread_count', { unreadCount })
+       - On failure → emit error + client.disconnect(true)
+
+  3. Client stays connected; Nest can push events anytime
+
+  4. handleDisconnect(client)
+       - Log only (rooms leave automatically)
+
+
+-------------------------------------------------------
+How Nest emits to a user
+-------------------------------------------------------
+
+  // Inside NotificationGateway
+  emitToUser(userId, event, payload) {
+    this.server.to(`user_${userId}`).emit(event, payload);
+  }
+
+  Why rooms instead of socket.id?
+    - User may have phone + laptop (multiple socket ids)
+    - Room user_<id> reaches ALL their connected devices
+    - After reconnect, socket.id changes; room name stays stable
+
+  Team broadcast:
+    this.server.to(`team_${organizationId}`).emit(...)
+
+
+-------------------------------------------------------
+Service → Gateway pattern (notify)
+-------------------------------------------------------
+
+  NotificationService.notify(input)
+    1. prisma.notification.create(...)     // persist
+    2. gateway.emitToUser(userId, 'notification.created', payload)
+    3. gateway.emitToUser(userId, 'notification.unread_count', { unreadCount })
+
+  Gateway is injected into NotificationService (same module).
+  NotificationModule is @Global() so any feature can inject NotificationService
+  without importing the module again (same idea as ActivityFeedModule).
+
+
+-------------------------------------------------------
+Client → server messages we support
+-------------------------------------------------------
+
+  @SubscribeMessage('notification.mark_read')
+    body: { id }
+    → update DB readAt
+    → emit notification.read + notification.unread_count back to client
+
+  @SubscribeMessage('notification.mark_all_read')
+    → updateMany unread
+    → emit notification.unread_count { unreadCount: 0 }
+
+  return { ok: true } from handler = Socket.IO acknowledgement
+  (frontend can pass a callback as 3rd arg to emit)
+
+
+-------------------------------------------------------
+Auth difference: HTTP vs Socket
+-------------------------------------------------------
+
+  HTTP:
+    JwtAuthGuard + Passport JwtStrategy
+    Header: Authorization: Bearer <token>
+    Runs per request
+
+  Socket:
+    Manual verify inside handleConnection (JwtService)
+    Handshake: auth: { token: '<access_jwt>' }
+    Runs once on connect (then client.data.userId is trusted for that socket)
+
+  Same JWT_ACCESS_SECRET / same payload { sub, email, role }.
+
+
+-------------------------------------------------------
+Module wiring
+-------------------------------------------------------
+
+  NotificationModule (@Global)
+    imports: JwtModule.registerAsync(...)   // for gateway JWT verify
+    providers: NotificationService, NotificationGateway
+    controllers: NotificationController
+    exports: NotificationService, NotificationGateway
+
+  AppModule imports NotificationModule early so other modules can notify.
+
+
+-------------------------------------------------------
+Scaling note (later)
+-------------------------------------------------------
+
+  One Nest process: current setup is enough (in-memory rooms).
+
+  Multiple Nest replicas behind a load balancer:
+    - User may connect to Node A; notify() runs on Node B
+    - Need @socket.io/redis-adapter so emits cross instances
+    - Redis is NOT required for single-container docker compose today
+
+
+-------------------------------------------------------
+Mental model
+-------------------------------------------------------
+
+  HTTP  = ask once, get answer, hang up
+  Socket.IO Gateway = phone call stays open; either side can talk
+
+  Nest @WebSocketGateway = the Nest "controller" for that phone call
+  Socket.IO namespace     = which "department" (notifications vs future chat)
+  Socket.IO path /socket.io = the wire (nginx must proxy this)
+  Rooms user_* / team_*     = who receives each message
+
+
+
+
+=======================================================
+Realtime notifications — namespace vs transport path
+=======================================================
+
+Three different things (easy to confuse):
+
+  1. REST API path        →  GET https://localhost/notifications
+  2. Socket.IO namespace →  /notifications  (logical channel, NOT an nginx path)
+  3. Socket.IO transport path →  /socket.io  (real HTTP/WebSocket URL path)
+
+They share the word "notifications" but mean different layers.
+
+
+-------------------------------------------------------
+How it fits together
+-------------------------------------------------------
+
+  Browser / Postman Socket.IO client
+           |
+           |  connect to HOST + namespace /notifications
+           |  actual HTTP requests go to PATH /socket.io/...
+           v
+  https://localhost/socket.io/?EIO=4&transport=websocket&...
+           |
+           v
+  nginx  location /socket.io/  { proxy_pass → Nest app:3000 }
+           |
+           v
+  NestJS  @WebSocketGateway({ namespace: '/notifications' })
+           |
+           v
+  NotificationGateway  (JWT auth, rooms user_<id>, emit events)
+
+
+-------------------------------------------------------
+Nest gateway config (src/notification/notification.gateway.ts)
+-------------------------------------------------------
+
+  @WebSocketGateway({
+    namespace: '/notifications',   // ← namespace only, not nginx location
+    cors: { origin: true, credentials: true },
+  })
+
+  No custom `path` → Socket.IO default path = /socket.io
+
+  If you ever changed path in gateway:
+    @WebSocketGateway({ path: '/realtime', namespace: '/notifications' })
+  then nginx would need location /realtime/ and client path: '/realtime'
+
+
+-------------------------------------------------------
+nginx (nginx/nginx.conf) — only /socket.io/ needed
+-------------------------------------------------------
+
+  # WebSocket upgrade map (bottom of http block)
+  map $http_upgrade $connection_upgrade {
+      default upgrade;
+      ''      close;
+  }
+
+  # Dedicated block for Socket.IO long-polling + websocket
+  location /socket.io/ {
+      proxy_pass http://nestjs_cluster;
+
+      proxy_http_version 1.1;
+
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto $scheme;
+
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection $connection_upgrade;
+
+      proxy_buffering off;
+      proxy_read_timeout 3600s;
+      proxy_send_timeout 3600s;
+  }
+
+  # REST /notifications goes through location / { ... } (normal HTTP)
+
+  DO NOT add location /notifications/ for sockets — that is the REST controller.
+  Socket namespace /notifications is handled inside /socket.io traffic.
+
+
+-------------------------------------------------------
+REST vs Socket (same host, different usage)
+-------------------------------------------------------
+
+  REST (HTTP):
+    GET    https://localhost/notifications
+    GET    https://localhost/notifications/unread-count
+    PATCH  https://localhost/notifications/:id/read
+    PATCH  https://localhost/notifications/read-all
+    Header: Authorization: Bearer <access_jwt>
+
+  Socket.IO (persistent connection):
+    Host:     https://localhost          (or http://localhost:3000 direct to Nest)
+    Namespace: /notifications
+    Path:     /socket.io                 (default — do not change unless gateway changes)
+    Auth:     handshake auth { "token": "<access_jwt>" }
+
+
+-------------------------------------------------------
+Next.js client
+-------------------------------------------------------
+
+  io(`${NEXT_PUBLIC_SOCKET_URL}/notifications`, {
+    auth: { token: accessToken },
+    // path defaults to '/socket.io'
+    transports: ['websocket', 'polling'],
+  });
+
+  NEXT_PUBLIC_SOCKET_URL=https://localhost
+  NEXT_PUBLIC_API_URL=https://localhost
+
+
+-------------------------------------------------------
+Postman Socket.IO test (v10+)
+-------------------------------------------------------
+
+  1. New → Socket.IO (NOT raw WebSocket, NOT HTTP GET)
+
+  2. Server URL (host only):
+       https://localhost
+     or http://localhost:3000   (skip nginx if cert issues)
+
+  3. Namespace:
+       /notifications
+
+  4. Path (if field shown):
+       /socket.io
+
+  5. Handshake auth:
+       { "token": "<access_jwt from POST /auth/login>" }
+
+  6. Connect → should receive:
+       event: notification.unread_count
+       data:  { "unreadCount": N }
+
+  7. Emit from Postman (client → server):
+
+       Event: notification.mark_read
+       Body:  { "id": "<notification-uuid>" }
+
+       Event: notification.mark_all_read
+       Body:  {} 
+
+  8. Listen for (server → client):
+
+       notification.created       — new row + live bell update
+       notification.unread_count  — badge count
+       notification.read          — after mark_read
+
+  9. Trigger a live event while connected:
+     - Connect Postman socket as OWNER
+     - In another tab, broker REST action e.g.:
+         POST /representative/broker/request
+     - Owner Postman should show notification.created
+
+
+-------------------------------------------------------
+Socket events cheat sheet
+-------------------------------------------------------
+
+  Server → client (listen with socket.on):
+    notification.created
+    notification.unread_count   { unreadCount: number }
+    notification.read           { id: string }
+
+  Client → server (emit with socket.emit):
+    notification.mark_read      { id: string }
+    notification.mark_all_read    (no body)
+
+  Business notifications (offer, visit, referral, etc.) are NOT emitted from
+  frontend. Backend creates them after REST actions via NotificationService.notify().
+
+
+-------------------------------------------------------
+Rooms (backend auto-join on connect)
+-------------------------------------------------------
+
+  user_<userId>           — only that user receives personal notifications
+  team_<organizationId>   — org owner + active members (team_joined, etc.)
+
+
+-------------------------------------------------------
+Common mistakes
+-------------------------------------------------------
+
+  X  io('https://localhost/notifications') as HTTP GET in Postman
+  ✓  Postman Socket.IO, host https://localhost, namespace /notifications
+
+  X  nginx location /notifications/ for websocket
+  ✓  nginx location /socket.io/ only
+
+  X  Confusing REST GET /notifications with socket namespace /notifications
+  ✓  REST = HTTP path; socket namespace = logical channel on /socket.io
+
+  X  Missing JWT in handshake auth.token
+  ✓  Gateway disconnects unauthorized clients
+
+  X  Expired access token on long-lived socket
+  ✓  Refresh token via POST /auth/refresh, update socket.auth.token, reconnect
+
+
+-------------------------------------------------------
+Docs in repo
+-------------------------------------------------------
+
+  src/notification/NOTIFICATION_WORKFLOW.md
+  src/notification/FRONTEND_NEXTJS_INTEGRATION.md
+
+
 ================================================================================
 END OF NOTES
 ================================================================================
